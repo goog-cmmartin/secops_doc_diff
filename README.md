@@ -1,5 +1,7 @@
 # Doc Diff Dashboard
 
+![Doc Diff Dashboard Screenshot](home_page.png)
+
 The Doc Diff Dashboard is a web application that monitors Google Cloud documentation for changes, summarizes them using generative AI, and presents them in a user-friendly interface.
 
 ## Features
