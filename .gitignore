@@ -1,0 +1,14 @@
+# Python
+venv/
+__pycache__/
+*.pyc
+
+# Database
+doc_content.db
+
+# Logs
+*.log
+
+# Google Cloud
+*service-account*.json
+application_default_credentials.json
