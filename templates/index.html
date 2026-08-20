@@ -236,14 +236,18 @@
             }
 
             function renderReports(reports) {
-                reportContent.innerHTML = '';
                 if (reports.length === 0) {
                     reportContent.innerHTML = '<p class="text-center">No reports found for the selected criteria.</p>';
                     return;
                 }
 
+                const htmlChunks = [];
                 let currentScrapeDate = null;
-                reports.forEach((report, index) => {
+                reports.forEach((report) => {
+                    if (report.scrape_date !== currentScrapeDate) {
+                        currentScrapeDate = report.scrape_date;
+                        htmlChunks.push(`<h2 class="mt-4">${formatDate(currentScrapeDate)}</h2>`);
+                    }
                     const cardHtml = `
                         <div class="card mt-3">
                             <div class="card-body" style="position: relative;">
@@ -265,21 +269,21 @@
                             </div>
                         </div>
                     `;
-                    if (report.scrape_date !== currentScrapeDate) {
-                        currentScrapeDate = report.scrape_date;
-                        reportContent.innerHTML += `<h2 class="mt-4">${formatDate(currentScrapeDate)}</h2>`;
-                    }
-                    reportContent.innerHTML += cardHtml;
+                    htmlChunks.push(cardHtml);
                 });
+
+                reportContent.innerHTML = htmlChunks.join('');
 
                 // Attach event listeners after rendering all reports
                 document.querySelectorAll('.copy-button').forEach(button => {
                     button.addEventListener('click', (event) => {
-                        if (event.target.dataset.summary) {
-                            copyToClipboard(event.target, event.target.dataset.summary, 'Copied! &#x2714;');
-                        } else if (event.target.dataset.logId) {
-                            const permalink = `${window.location.origin}${window.location.pathname}?log_id=${event.target.dataset.logId}`;
-                            copyToClipboard(event.target, permalink, 'Link Copied! &#x2714;');
+                        const target = event.target.closest('.copy-button');
+                        if (!target) return;
+                        if (target.dataset.summary) {
+                            copyToClipboard(target, target.dataset.summary, 'Copied! &#x2714;');
+                        } else if (target.dataset.logId) {
+                            const permalink = `${window.location.origin}${window.location.pathname}?log_id=${target.dataset.logId}`;
+                            copyToClipboard(target, permalink, 'Link Copied! &#x2714;');
                         }
                     });
                 });
@@ -451,7 +455,23 @@
                 }
             });
 
-            filterToolbar.addEventListener('input', () => fetchReportsAndChart());
+            function debounce(func, wait) {
+                let timeout;
+                return function(...args) {
+                    clearTimeout(timeout);
+                    timeout = setTimeout(() => func.apply(this, args), wait);
+                };
+            }
+
+            const debouncedFetch = debounce(() => fetchReportsAndChart(), 300);
+            filterToolbar.addEventListener('input', (event) => {
+                if (event.target.id === 'search-input') {
+                    debouncedFetch();
+                } else {
+                    fetchReportsAndChart();
+                }
+            });
+            filterToolbar.addEventListener('change', () => fetchReportsAndChart());
             
             initializePage();
         });

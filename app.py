@@ -132,7 +132,9 @@ def get_products():
     cursor.execute("SELECT DISTINCT source_tag FROM change_log WHERE source_tag IS NOT NULL AND source_tag != '' ORDER BY source_tag")
     products = [row['source_tag'] for row in cursor.fetchall()]
     conn.close()
-    return jsonify(products)
+    response = jsonify(products)
+    response.headers['Cache-Control'] = 'public, max-age=300'
+    return response
 
 @app.route('/api/last_updated')
 def get_last_updated():
@@ -142,7 +144,9 @@ def get_last_updated():
     cursor.execute("SELECT MAX(scrape_date) FROM change_log")
     last_updated = cursor.fetchone()[0]
     conn.close()
-    return jsonify({'last_updated': last_updated})
+    response = jsonify({'last_updated': last_updated})
+    response.headers['Cache-Control'] = 'public, max-age=60'
+    return response
 
 @app.route('/api/activity')
 def get_activity_data():

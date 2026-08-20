@@ -111,14 +111,54 @@ def get_content_versions(url, change_type):
     conn.close()
     return current_content, archived_content
 
+MAX_PROMPT_CHARS = 250000
+
+def parse_gemini_response(response_text):
+    """Extracts summary and importance from Gemini response."""
+    import json
+    # Try parsing JSON directly
+    try:
+        # Check if wrapped in markdown code blocks ```json ... ```
+        clean_text = response_text.strip()
+        if clean_text.startswith("```json"):
+            clean_text = clean_text[7:]
+        elif clean_text.startswith("```"):
+            clean_text = clean_text[3:]
+        if clean_text.endswith("```"):
+            clean_text = clean_text[:-3]
+        clean_text = clean_text.strip()
+
+        data = json.loads(clean_text)
+        summary = data.get("summary", "").strip()
+        importance = data.get("importance", "").strip()
+        if importance not in ["Low", "Medium", "High", "Critical"]:
+            importance = "Medium"
+        return summary, importance
+    except Exception:
+        # Fallback to plain text if JSON parsing fails
+        return response_text.strip(), "Medium"
+
 def summarize_with_gemini(change_type, current_content, archived_content=None):
-    """Summarizes content change using Gemini API with retry logic for rate limiting."""
+    """Summarizes content change and evaluates importance using Gemini API with retry logic."""
     model = get_gemini_model()
     if not model:
-        return "Error: Gemini model not available."
+        return "Error: Gemini model not available.", None
+
+    system_instructions = (
+        "You are an expert technical documentation analyst. "
+        "Analyze the document changes and provide:\n"
+        "1. A concise, clear markdown summary focusing strictly on meaningful additions, changes, or removals.\n"
+        "2. An importance score rated strictly as one of: 'Low' (minor wording/formatting/typos), 'Medium' (clarifications, parameter additions), 'High' (new features, architectural changes, breaking changes, new APIs), or 'Critical' (security advisories, critical deprecations).\n\n"
+        "Respond ONLY in valid JSON matching this exact format:\n"
+        '{\n  "summary": "<markdown summary here>",\n  "importance": "Low" | "Medium" | "High" | "Critical"\n}'
+    )
 
     if change_type == 'new':
-        prompt = f"""Summarize the key information in this new document:\n\n--- NEW CONTENT ---\n{current_content}\n--- END CONTENT ---"""
+        content = current_content or ""
+        if len(content) > MAX_PROMPT_CHARS:
+            logging.warning(f"Content length ({len(content)} chars) exceeds limit. Truncating.")
+            content = content[:MAX_PROMPT_CHARS] + "\n\n... [Content truncated due to size] ..."
+        prompt = f"""{system_instructions}\n\n--- NEW DOCUMENT CONTENT ---\n{content}\n--- END CONTENT ---"""
     elif change_type == 'updated':
         diff = "".join(difflib.unified_diff(
             (archived_content or "").splitlines(keepends=True),
@@ -127,29 +167,33 @@ def summarize_with_gemini(change_type, current_content, archived_content=None):
             tofile='current',
         ))
         if not diff.strip():
-            return "No textual changes detected."
-        prompt = f"""Summarize the key changes in this document based on the following diff:\n\n--- DIFF ---\n{diff}\n--- END DIFF ---"""
+            return "No textual changes detected.", "Low"
+        if len(diff) > MAX_PROMPT_CHARS:
+            logging.warning(f"Diff length ({len(diff)} chars) exceeds limit. Truncating.")
+            diff = diff[:MAX_PROMPT_CHARS] + "\n\n... [Diff truncated due to size] ..."
+        prompt = f"""{system_instructions}\n\n--- DIFF ---\n{diff}\n--- END DIFF ---"""
     else:
-        return "Unsupported change type."
+        return "Unsupported change type.", None
 
     max_retries = 5
     for attempt in range(max_retries):
         try:
             response = model.generate_content(prompt)
-            return response.text.strip()
+            summary, importance = parse_gemini_response(response.text)
+            return summary, importance
         except Exception as e:
-            if "429" in str(e): # Check for rate limit error
+            if "429" in str(e): # Rate limit
                 logging.warning(f"Rate limit hit. Waiting 60 seconds before retry {attempt + 1}/{max_retries}...")
                 time.sleep(60)
             else:
                 logging.error(f"API call for summarization failed: {e}")
-                return "Error: Failed to generate summary."
+                return "Error: Failed to generate summary.", None
 
     logging.error(f"Failed to generate summary after {max_retries} retries.")
-    return "Error: Failed to generate summary after multiple retries."
+    return "Error: Failed to generate summary after multiple retries.", None
 
-def update_summary_in_db(log_id, summary):
-    """Updates the summary for a specific log_id in the change_log table with retry logic."""
+def update_summary_in_db(log_id, summary, importance=None):
+    """Updates the summary and importance for a specific log_id in the change_log table with retry logic."""
     max_retries = 5
     for attempt in range(max_retries):
         try:
@@ -157,7 +201,10 @@ def update_summary_in_db(log_id, summary):
             conn.execute("PRAGMA journal_mode=WAL;")
             conn.execute("PRAGMA busy_timeout=60000;")
             cursor = conn.cursor()
-            cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
+            if importance:
+                cursor.execute("UPDATE change_log SET summary = ?, importance = ? WHERE log_id = ?", (summary, importance, log_id))
+            else:
+                cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
             conn.commit()
             conn.close()
             return
@@ -214,11 +261,11 @@ def main():
                 logging.warning(f"Could not retrieve current content for {url}. Skipping.")
                 continue
 
-            summary = summarize_with_gemini(change_type, current_content, archived_content)
+            summary, importance = summarize_with_gemini(change_type, current_content, archived_content)
 
             if summary and not summary.startswith("Error:"):
-                update_summary_in_db(log_id, summary)
-                logging.info(f"Successfully generated and saved summary for: {url}")
+                update_summary_in_db(log_id, summary, importance)
+                logging.info(f"Successfully generated and saved summary ({importance or 'N/A'}) for: {url}")
             else:
                 logging.error(f"Failed to generate a valid summary for {url}. Skipping database update.")
         except Exception as e:
