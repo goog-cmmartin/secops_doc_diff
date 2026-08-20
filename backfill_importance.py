@@ -69,15 +69,22 @@ def get_importance_rating(summary):
     logging.error(f"Failed to get importance rating after {retries} attempts for summary: {summary[:100]}...")
     return None # Failed after retries
 
-def backfill_importance(dry_run=False):
+def backfill_importance(dry_run=False, date=None):
     """
     Connects to the database and backfills the 'importance' column for existing entries.
     """
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
 
-    cursor.execute("SELECT log_id, summary FROM change_log WHERE importance IS NULL AND summary IS NOT NULL")
+    query = "SELECT log_id, summary FROM change_log WHERE importance IS NULL AND summary IS NOT NULL"
+    params = []
+    if date:
+        query += " AND scrape_date = ?"
+        params.append(date)
+
+    cursor.execute(query, tuple(params))
     entries_to_backfill = cursor.fetchall()
     
     if not entries_to_backfill:
@@ -90,16 +97,19 @@ def backfill_importance(dry_run=False):
 
     for i, (log_id, summary) in enumerate(entries_to_backfill):
         logging.info(f"Processing entry {i+1}/{len(entries_to_backfill)} (log_id: {log_id})...")
-        importance = get_importance_rating(summary)
-        if importance:
-            if dry_run:
-                logging.info(f"{log_prefix}Would update log_id {log_id} with importance: {importance}")
+        try:
+            importance = get_importance_rating(summary)
+            if importance:
+                if dry_run:
+                    logging.info(f"{log_prefix}Would update log_id {log_id} with importance: {importance}")
+                else:
+                    cursor.execute("UPDATE change_log SET importance = ? WHERE log_id = ?", (importance, log_id))
+                    conn.commit()
+                    logging.info(f"  Updated log_id {log_id} with importance: {importance}")
             else:
-                cursor.execute("UPDATE change_log SET importance = ? WHERE log_id = ?", (importance, log_id))
-                conn.commit()
-                logging.info(f"  Updated log_id {log_id} with importance: {importance}")
-        else:
-            logging.warning(f"  Could not determine importance for log_id {log_id}. Skipping.")
+                logging.warning(f"  Could not determine importance for log_id {log_id}. Skipping.")
+        except Exception as e:
+            logging.error(f"Error updating importance for log_id {log_id}: {e}", exc_info=True)
         
         time.sleep(1) # Add a small delay to respect potential API rate limits
 
@@ -113,6 +123,11 @@ if __name__ == "__main__":
         action='store_true',
         help="Perform a dry run without committing any changes to the database."
     )
+    parser.add_argument(
+        '--date',
+        type=str,
+        help="Optional. The date to backfill importance for, in YYYY-MM-DD format."
+    )
     args = parser.parse_args()
     
-    backfill_importance(dry_run=args.dry_run)
+    backfill_importance(dry_run=args.dry_run, date=args.date)

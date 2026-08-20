@@ -35,8 +35,9 @@ def create_session_with_retries():
 
 def setup_database():
     """Initializes the database and creates/updates tables for pages, archive, and change log."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS pages (
@@ -168,6 +169,7 @@ def scrape_text(url, session):
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             content_area = soup.find('div', class_='devsite-article-body') or soup.find('article') or soup.find('main')
+            logging.info(f"Scraping {url}, found content_area: {content_area}")
             return content_area.get_text(separator=' ', strip=True) if content_area else ""
     except requests.exceptions.RequestException as e:
         logging.warning(f"Could not scrape text from {url}: {e}")
@@ -180,6 +182,11 @@ def main():
         action='store_true',
         help="Run only the database setup function and exit."
     )
+    parser.add_argument(
+        '--url',
+        type=str,
+        help="Optional. Scrape a single URL."
+    )
     args = parser.parse_args()
 
     if args.setup_only:
@@ -188,11 +195,40 @@ def main():
 
     setup_database()
     session = create_session_with_retries()
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
     
     scrape_date = datetime.now().date()
     logging.info(f"--- Starting scrape for {scrape_date} ---")
+
+    if args.url:
+        logging.info(f"Scraping single URL: {args.url}")
+        content = scrape_text(args.url, session)
+        if content:
+            cleaned_content = clean_content(content)
+            new_hash = calculate_hash(cleaned_content)
+            source_tag = next((tag for tag, base in DOC_SOURCES.items() if args.url.startswith(base)), "Unknown")
+            cursor.execute("SELECT content_hash FROM pages WHERE url=?", (args.url,))
+            db_hash = cursor.fetchone()
+            if db_hash and db_hash[0] == new_hash:
+                logging.info("Content has not changed.")
+            else:
+                logging.info("Content has changed.")
+                if db_hash:
+                    cursor.execute("SELECT content FROM pages WHERE url=?", (args.url,))
+                    old_content_row = cursor.fetchone()
+                    if old_content_row:
+                        cursor.execute("INSERT INTO pages_archive (url, content) VALUES (?, ?)", (args.url, old_content_row[0]))
+                    cursor.execute("UPDATE pages SET content=?, content_hash=?, scraped_at=CURRENT_TIMESTAMP WHERE url=?", (content, new_hash, args.url))
+                else:
+                    cursor.execute("INSERT INTO pages (url, content, content_hash, source_tag) VALUES (?, ?, ?, ?)", (args.url, content, new_hash, source_tag))
+                cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, args.url, 'updated', new_hash, source_tag))
+        conn.commit()
+        conn.close()
+        session.close()
+        return
 
     cursor.execute("SELECT url, content_hash FROM pages")
     db_state = {row[0]: row[1] for row in cursor.fetchall()}
@@ -250,6 +286,7 @@ def main():
     for url in removed_urls:
         source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
         cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, source_tag) VALUES (?, ?, ?, ?)", (scrape_date, url, 'removed', source_tag))
+    conn.commit()
 
     logging.info(f"Found {len(new_urls)} new URLs to scrape.")
     for i, url in enumerate(new_urls):
@@ -261,6 +298,7 @@ def main():
             source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
             cursor.execute("INSERT INTO pages (url, content, content_hash, source_tag) VALUES (?, ?, ?, ?)", (url, content, new_hash, source_tag))
             cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'new', new_hash, source_tag))
+            conn.commit()
 
     logging.info(f"Checking {len(existing_urls)} existing URLs for content changes...")
     for i, url in enumerate(existing_urls):
@@ -281,9 +319,13 @@ def main():
             cursor.execute("UPDATE pages SET content=?, content_hash=?, scraped_at=CURRENT_TIMESTAMP WHERE url=?", (live_content, new_hash, url))
             source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
             cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'updated', new_hash, source_tag))
+            conn.commit()
         else:
             source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
             cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'unchanged', old_hash, source_tag))
+        
+        if i % 50 == 0:
+            conn.commit()
     
     conn.commit()
 

@@ -34,7 +34,9 @@ def get_gemini_model():
 
 def get_changes(filter_url=None, backfill=False):
     """Fetches changes from the database, intelligently skipping 'new' items on the first day."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
 
     params = []
@@ -60,8 +62,8 @@ def get_changes(filter_url=None, backfill=False):
         cursor.execute("SELECT MIN(scrape_date) FROM change_log")
         earliest_scrape_date = cursor.fetchone()[0]
 
-        # Base query
-        query = "SELECT log_id, url, change_type FROM change_log WHERE scrape_date = ?"
+        # Base query - only select items that don't already have a summary
+        query = "SELECT log_id, url, change_type FROM change_log WHERE scrape_date = ? AND summary IS NULL"
 
         # If it's the first day, only summarize updates (of which there will be none).
         # Otherwise, summarize both new and updated items.
@@ -81,7 +83,9 @@ def get_changes(filter_url=None, backfill=False):
 
 def get_content_versions(url, change_type):
     """Fetches content for a given URL based on the change type."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
+    conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
 
     current_content = None
@@ -114,7 +118,7 @@ def summarize_with_gemini(change_type, current_content, archived_content=None):
         return "Error: Gemini model not available."
 
     if change_type == 'new':
-        prompt = f"Summarize the key information in this new document:\n\n--- NEW CONTENT ---\n{current_content}\n--- END CONTENT ---"
+        prompt = f"""Summarize the key information in this new document:\n\n--- NEW CONTENT ---\n{current_content}\n--- END CONTENT ---"""
     elif change_type == 'updated':
         diff = "".join(difflib.unified_diff(
             (archived_content or "").splitlines(keepends=True),
@@ -124,7 +128,7 @@ def summarize_with_gemini(change_type, current_content, archived_content=None):
         ))
         if not diff.strip():
             return "No textual changes detected."
-        prompt = f"Summarize the key changes in this document based on the following diff:\n\n--- DIFF ---\n{diff}\n--- END DIFF ---"
+        prompt = f"""Summarize the key changes in this document based on the following diff:\n\n--- DIFF ---\n{diff}\n--- END DIFF ---"""
     else:
         return "Unsupported change type."
 
@@ -144,15 +148,26 @@ def summarize_with_gemini(change_type, current_content, archived_content=None):
     logging.error(f"Failed to generate summary after {max_retries} retries.")
     return "Error: Failed to generate summary after multiple retries."
 
-from datetime import datetime
-
 def update_summary_in_db(log_id, summary):
-    """Updates the summary for a specific log_id in the change_log table."""
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
-    conn.commit()
-    conn.close()
+    """Updates the summary for a specific log_id in the change_log table with retry logic."""
+    max_retries = 5
+    for attempt in range(max_retries):
+        try:
+            conn = sqlite3.connect(DB_NAME, timeout=60.0)
+            conn.execute("PRAGMA journal_mode=WAL;")
+            conn.execute("PRAGMA busy_timeout=60000;")
+            cursor = conn.cursor()
+            cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
+            conn.commit()
+            conn.close()
+            return
+        except sqlite3.OperationalError as e:
+            if "locked" in str(e) and attempt < max_retries - 1:
+                logging.warning(f"Database locked updating log_id {log_id}. Retrying in {(attempt + 1) * 2}s...")
+                time.sleep((attempt + 1) * 2)
+            else:
+                logging.error(f"Failed to update summary in database for log_id {log_id}: {e}")
+                raise
 
 def main():
     parser = argparse.ArgumentParser(
@@ -191,20 +206,23 @@ def main():
         return
 
     for log_id, url, change_type in changes:
-        logging.info(f"Processing {change_type.upper()} change for: {url} (Log ID: {log_id})")
-        current_content, archived_content = get_content_versions(url, change_type)
+        try:
+            logging.info(f"Processing {change_type.upper()} change for: {url} (Log ID: {log_id})")
+            current_content, archived_content = get_content_versions(url, change_type)
 
-        if not current_content:
-            logging.warning(f"Could not retrieve current content for {url}. Skipping.")
-            continue
+            if not current_content:
+                logging.warning(f"Could not retrieve current content for {url}. Skipping.")
+                continue
 
-        summary = summarize_with_gemini(change_type, current_content, archived_content)
+            summary = summarize_with_gemini(change_type, current_content, archived_content)
 
-        if summary and not summary.startswith("Error:"):
-            update_summary_in_db(log_id, summary)
-            logging.info(f"Successfully generated and saved summary for: {url}")
-        else:
-            logging.error(f"Failed to generate a valid summary for {url}. Skipping database update.")
+            if summary and not summary.startswith("Error:"):
+                update_summary_in_db(log_id, summary)
+                logging.info(f"Successfully generated and saved summary for: {url}")
+            else:
+                logging.error(f"Failed to generate a valid summary for {url}. Skipping database update.")
+        except Exception as e:
+            logging.error(f"Error processing change for {url} (Log ID: {log_id}): {e}", exc_info=True)
 
 
 if __name__ == "__main__":

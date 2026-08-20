@@ -7,8 +7,9 @@ app = Flask(__name__)
 
 def get_db_connection():
     """Creates a database connection."""
-    conn = sqlite3.connect(DB_NAME)
+    conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
+    conn.execute("PRAGMA busy_timeout=60000;")
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -64,7 +65,7 @@ def get_reports():
             sort_order = 'DESC'
 
         if not end_date_str:
-            cursor.execute("SELECT MAX(scrape_date) FROM change_log")
+            cursor.execute("SELECT MAX(scrape_date) FROM change_log WHERE summary IS NOT NULL")
             latest_date = cursor.fetchone()[0]
             end_date_str = latest_date if latest_date else datetime.now().strftime('%Y-%m-%d')
         

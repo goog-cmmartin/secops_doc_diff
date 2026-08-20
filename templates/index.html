@@ -243,40 +243,33 @@
                 }
 
                 let currentScrapeDate = null;
-                reports.forEach(report => {
-                    if (report.scrape_date !== currentScrapeDate) {
-                        currentScrapeDate = report.scrape_date;
-                        reportContent.innerHTML += `<h2 class="mt-4">${formatDate(currentScrapeDate)}</h2>`;
-                    }
-                    const badgeClass = report.change_type === 'new' ? 'badge-outline-success' : 'badge-outline-primary';
-                    const summaryForDisplay = report.summary ? marked.parse(report.summary) : '<p class="text-muted fst-italic">No summary was generated.</p>';
-                    const summaryForCopy = report.plain_summary || '';
-                    const shortUrl = getShortenedUrl(report.url);
-                    const displayUrl = humanizeUrl(shortUrl);
-                    const iconPath = productIcons[report.source_tag];
-                    const iconHtml = iconPath ? `<img src="${iconPath}" class="product-icon">` : '';
-
-                    reportContent.innerHTML += `
+                reports.forEach((report, index) => {
+                    const cardHtml = `
                         <div class="card mt-3">
                             <div class="card-body" style="position: relative;">
                                 <h5 class="card-title d-flex flex-column flex-md-row justify-content-md-between align-items-start align-items-md-center mb-2">
                                     <div class="d-flex align-items-center">
-                                        ${iconHtml}
-                                        <a href="${report.url}" target="_blank">${displayUrl}</a>
+                                        ${productIcons[report.source_tag] ? `<img src="${productIcons[report.source_tag]}" class="product-icon">` : ''}
+                                        <a href="${report.url}" target="_blank">${humanizeUrl(getShortenedUrl(report.url))}</a>
                                     </div>
                                     <div class="mt-2 mt-md-0">
                                         <span class="badge badge-outline-secondary text-uppercase">${report.source_tag}</span>
-                                        <span class="badge ${badgeClass} text-uppercase">${report.change_type}</span>
+                                        <span class="badge ${report.change_type === 'new' ? 'badge-outline-success' : 'badge-outline-primary'} text-uppercase">${report.change_type}</span>
                                         ${report.importance ? `<span class="badge ${getImportanceBadgeClass(report.importance)} text-uppercase">${report.importance}</span>` : ''}
                                     </div>
                                 </h5>
                                 <hr class="subtle-hr">
-                                <div class="card-text">${summaryForDisplay}</div>
-                                <button class="btn btn-outline-secondary copy-button" data-summary="${encodeHTML(summaryForCopy)}" title="Copy Summary">📋</button>
+                                <div class="card-text">${report.summary ? marked.parse(report.summary) : '<p class="text-muted fst-italic">No summary was generated.</p>'}</div>
+                                <button class="btn btn-outline-secondary copy-button" data-summary="${encodeHTML(report.plain_summary || '')}" title="Copy Summary">📋</button>
                                 <button class="btn btn-outline-secondary copy-button" style="right: 50px;" data-log-id="${report.log_id}" title="Copy Link">🔗</button>
                             </div>
                         </div>
                     `;
+                    if (report.scrape_date !== currentScrapeDate) {
+                        currentScrapeDate = report.scrape_date;
+                        reportContent.innerHTML += `<h2 class="mt-4">${formatDate(currentScrapeDate)}</h2>`;
+                    }
+                    reportContent.innerHTML += cardHtml;
                 });
 
                 // Attach event listeners after rendering all reports

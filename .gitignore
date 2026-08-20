@@ -12,3 +12,8 @@ doc_content.db
 # Google Cloud
 *service-account*.json
 application_default_credentials.json
+doc_content.db*
+*.txt
+*_new.py
+test_batch.py
+vertex_ai_sdk_migration_guide_2.md
