@@ -263,7 +263,7 @@
                                     </div>
                                 </h5>
                                 <hr class="subtle-hr">
-                                <div class="card-text">${report.summary ? marked.parse(report.summary) : '<p class="text-muted fst-italic">No summary was generated.</p>'}</div>
+                                <div class="card-text">${report.summary ? marked.parse(report.summary) : (report.change_type === 'removed' ? '<p class="text-muted fst-italic">This page was removed from the documentation.</p>' : '<p class="text-muted fst-italic">No summary was generated.</p>')}</div>
                                 <button class="btn btn-outline-secondary copy-button" data-summary="${encodeHTML(report.plain_summary || '')}" title="Copy Summary">📋</button>
                                 <button class="btn btn-outline-secondary copy-button" style="right: 50px;" data-log-id="${report.log_id}" title="Copy Link">🔗</button>
                             </div>

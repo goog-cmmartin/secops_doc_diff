@@ -1,5 +1,6 @@
 import sqlite3
 import os
+import re
 from google.cloud import aiplatform
 import vertexai
 from vertexai.generative_models import GenerativeModel
@@ -32,7 +33,7 @@ def get_gemini_model():
         logging.error(f"Failed to initialize Gemini model: {e}")
         return None
 
-def get_changes(filter_url=None, backfill=False):
+def get_changes(filter_url=None, backfill=False, re_summarize_empty=False, target_date=None):
     """Fetches changes from the database, intelligently skipping 'new' items on the first day."""
     conn = sqlite3.connect(DB_NAME, timeout=60.0)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -41,7 +42,33 @@ def get_changes(filter_url=None, backfill=False):
 
     params = []
 
-    if backfill:
+    if target_date:
+        if re_summarize_empty:
+            query = """
+                SELECT log_id, url, change_type
+                FROM change_log
+                WHERE scrape_date = ?
+                AND change_type IN ('new', 'updated')
+                AND (summary IS NULL OR summary = '' OR summary = 'No textual changes detected.')
+            """
+        else:
+            query = """
+                SELECT log_id, url, change_type
+                FROM change_log
+                WHERE scrape_date = ?
+                AND summary IS NULL
+                AND change_type IN ('new', 'updated')
+            """
+        params.append(target_date)
+    elif re_summarize_empty:
+        query = """
+            SELECT log_id, url, change_type
+            FROM change_log
+            WHERE change_type IN ('new', 'updated')
+            AND (summary IS NULL OR summary = '' OR summary = 'No textual changes detected.')
+            AND (change_type = 'updated' OR (change_type = 'new' AND scrape_date > (SELECT MIN(scrape_date) FROM change_log)))
+        """
+    elif backfill:
         # Backfill all 'updated' and 'new' items, except for 'new' items from the very first scrape date.
         query = """
             SELECT log_id, url, change_type
@@ -97,16 +124,28 @@ def get_content_versions(url, change_type):
         if current_row:
             current_content = current_row[0]
 
-    if change_type == 'updated':
+    if change_type == 'updated' and current_content:
+        # First attempt to find the latest archive that has DIFFERENT content than the current version
         cursor.execute("""
             SELECT content FROM pages_archive
-            WHERE url=?
+            WHERE url=? AND content != ?
             ORDER BY archived_at DESC
             LIMIT 1
-        """, (url,))
+        """, (url, current_content))
         archive_row = cursor.fetchone()
         if archive_row:
             archived_content = archive_row[0]
+        else:
+            # Fallback to the latest archive if no differing archive found
+            cursor.execute("""
+                SELECT content FROM pages_archive
+                WHERE url=?
+                ORDER BY archived_at DESC
+                LIMIT 1
+            """, (url,))
+            fallback_row = cursor.fetchone()
+            if fallback_row:
+                archived_content = fallback_row[0]
 
     conn.close()
     return current_content, archived_content
@@ -116,27 +155,41 @@ MAX_PROMPT_CHARS = 250000
 def parse_gemini_response(response_text):
     """Extracts summary and importance from Gemini response."""
     import json
-    # Try parsing JSON directly
-    try:
-        # Check if wrapped in markdown code blocks ```json ... ```
-        clean_text = response_text.strip()
-        if clean_text.startswith("```json"):
-            clean_text = clean_text[7:]
-        elif clean_text.startswith("```"):
-            clean_text = clean_text[3:]
-        if clean_text.endswith("```"):
-            clean_text = clean_text[:-3]
-        clean_text = clean_text.strip()
+    clean_text = response_text.strip()
+    if clean_text.startswith("```json"):
+        clean_text = clean_text[7:]
+    elif clean_text.startswith("```"):
+        clean_text = clean_text[3:]
+    if clean_text.endswith("```"):
+        clean_text = clean_text[:-3]
+    clean_text = clean_text.strip()
 
+    try:
         data = json.loads(clean_text)
         summary = data.get("summary", "").strip()
         importance = data.get("importance", "").strip()
         if importance not in ["Low", "Medium", "High", "Critical"]:
             importance = "Medium"
-        return summary, importance
+        if summary:
+            return summary, importance
     except Exception:
-        # Fallback to plain text if JSON parsing fails
-        return response_text.strip(), "Medium"
+        pass
+
+    # Regex search for JSON block
+    json_match = re.search(r'\{.*\}', response_text, re.DOTALL)
+    if json_match:
+        try:
+            data = json.loads(json_match.group(0))
+            summary = data.get("summary", "").strip()
+            importance = data.get("importance", "").strip()
+            if importance not in ["Low", "Medium", "High", "Critical"]:
+                importance = "Medium"
+            if summary:
+                return summary, importance
+        except Exception:
+            pass
+
+    return response_text.strip(), "Medium"
 
 def summarize_with_gemini(change_type, current_content, archived_content=None):
     """Summarizes content change and evaluates importance using Gemini API with retry logic."""
@@ -209,8 +262,8 @@ def update_summary_in_db(log_id, summary, importance=None):
             conn.close()
             return
         except sqlite3.OperationalError as e:
-            if "locked" in str(e) and attempt < max_retries - 1:
-                logging.warning(f"Database locked updating log_id {log_id}. Retrying in {(attempt + 1) * 2}s...")
+            if attempt < max_retries - 1:
+                logging.warning(f"Database operational error updating log_id {log_id}. Retrying in {(attempt + 1) * 2}s: {e}")
                 time.sleep((attempt + 1) * 2)
             else:
                 logging.error(f"Failed to update summary in database for log_id {log_id}: {e}")
@@ -232,13 +285,23 @@ def main():
         help="If set, summarizes all historical changes that are missing a summary."
     )
     parser.add_argument(
+        '--re-summarize-empty',
+        action='store_true',
+        help="Re-summarize items where summary is missing or 'No textual changes detected.'"
+    )
+    parser.add_argument(
+        '--date',
+        type=str,
+        help="Optional. Summarize changes for a specific date (YYYY-MM-DD)."
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help="Estimate the number of changes to be processed without running the summarizer."
     )
     args = parser.parse_args()
 
-    changes = get_changes(args.filter, args.backfill)
+    changes = get_changes(args.filter, args.backfill, args.re_summarize_empty, args.date)
 
     if args.dry_run:
         logging.info("--- DRY RUN MODE ---")

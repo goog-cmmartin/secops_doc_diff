@@ -22,11 +22,16 @@ logging.basicConfig(
 )
 
 def create_session_with_retries():
-    """Creates a requests.Session with a robust retry strategy."""
+    """Creates a requests.Session with a robust retry strategy and browser user-agent."""
     session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9"
+    })
     retry_strategy = Retry(
         total=5,
-        backoff_factor=1,
+        backoff_factor=2,
         status_forcelist=[429, 500, 502, 503, 504],
         allowed_methods=["HEAD", "GET", "OPTIONS"]
     )
@@ -144,7 +149,7 @@ def fetch_page_and_links(url, base_url, session, source_page_url=None):
     content_hash = ""
 
     try:
-        with session.get(url, timeout=10) as response:
+        with session.get(url, timeout=12) as response:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             
@@ -174,7 +179,7 @@ def fetch_page_and_links(url, base_url, session, source_page_url=None):
 def scrape_single_url(url, session):
     """Scrapes a single URL for content."""
     try:
-        with session.get(url, timeout=10) as response:
+        with session.get(url, timeout=12) as response:
             response.raise_for_status()
             soup = BeautifulSoup(response.text, 'html.parser')
             content_area = soup.find('div', class_='devsite-article-body') or soup.find('article') or soup.find('main')
@@ -183,7 +188,7 @@ def scrape_single_url(url, session):
         logging.warning(f"Could not scrape text from {url}: {e}")
         return ""
 
-def crawl_source(source_tag, base_url, max_workers=8):
+def crawl_source(source_tag, base_url, max_workers=4):
     """Crawls a doc source concurrently in a single pass extracting both links and content."""
     logging.info(f"Crawling source: {source_tag} with {max_workers} threads...")
     
@@ -252,8 +257,8 @@ def main():
     parser.add_argument(
         '--workers',
         type=int,
-        default=8,
-        help="Number of concurrent worker threads for crawling (default: 8)."
+        default=4,
+        help="Number of concurrent worker threads for crawling (default: 4)."
     )
     args = parser.parse_args()
 
@@ -288,12 +293,19 @@ def main():
                 if db_hash:
                     cursor.execute("SELECT content FROM pages WHERE url=?", (args.url,))
                     old_content_row = cursor.fetchone()
-                    if old_content_row:
+                    if old_content_row and old_content_row[0] != content:
                         cursor.execute("INSERT INTO pages_archive (url, content) VALUES (?, ?)", (args.url, old_content_row[0]))
                     cursor.execute("UPDATE pages SET content=?, content_hash=?, scraped_at=CURRENT_TIMESTAMP WHERE url=?", (content, new_hash, args.url))
                 else:
                     cursor.execute("INSERT INTO pages (url, content, content_hash, source_tag) VALUES (?, ?, ?, ?)", (args.url, content, new_hash, source_tag))
-                cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, args.url, 'updated', new_hash, source_tag))
+                
+                # Check for existing change_log entry today
+                cursor.execute("SELECT log_id FROM change_log WHERE scrape_date=? AND url=? AND change_type='updated'", (scrape_date, args.url))
+                existing = cursor.fetchone()
+                if existing:
+                    cursor.execute("UPDATE change_log SET content_hash=? WHERE log_id=?", (new_hash, existing[0]))
+                else:
+                    cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, args.url, 'updated', new_hash, source_tag))
             conn.commit()
             conn.close()
         session.close()
@@ -305,8 +317,12 @@ def main():
     conn.execute("PRAGMA busy_timeout=60000;")
     cursor = conn.cursor()
     
-    cursor.execute("SELECT url, content_hash FROM pages")
-    db_state = {row[0]: row[1] for row in cursor.fetchall()}
+    cursor.execute("SELECT url, content_hash, source_tag FROM pages")
+    db_rows = cursor.fetchall()
+    db_state = {row[0]: row[1] for row in db_rows}
+    db_urls_by_source = {}
+    for url, _, source_tag in db_rows:
+        db_urls_by_source.setdefault(source_tag, set()).add(url)
     logging.info(f"Found {len(db_state)} pages in the local database.")
 
     # Crawl all sources concurrently
@@ -330,27 +346,49 @@ def main():
             )
         conn.commit()
 
-    # Diff calculation
+    # Diff calculation per source with safety guard against partial crawl/rate limit drops
     all_live_urls = set(all_scraped_pages.keys())
     db_urls = set(db_state.keys())
     
     new_urls = all_live_urls - db_urls
-    removed_urls = db_urls - all_live_urls
     existing_urls = all_live_urls.intersection(db_urls)
+    
+    # Calculate removed URLs per source with safety threshold
+    removed_urls = set()
+    for source_tag, base_url in DOC_SOURCES.items():
+        source_db_urls = db_urls_by_source.get(source_tag, set())
+        source_scraped_urls = {u for u, data in all_scraped_pages.items() if data[3] == source_tag}
+        
+        # Safety guard: if a source fetched fewer than 50% of known DB pages, skip removals to avoid false positives
+        if len(source_db_urls) > 10 and len(source_scraped_urls) < (len(source_db_urls) * 0.5):
+            logging.warning(
+                f"Source '{source_tag}' crawl retrieved only {len(source_scraped_urls)}/{len(source_db_urls)} pages. "
+                "Skipping removal detection for this source to prevent false removals."
+            )
+            continue
+        
+        removed_urls.update(source_db_urls - source_scraped_urls)
 
     logging.info(f"Diff Summary: {len(new_urls)} new, {len(removed_urls)} removed, {len(existing_urls)} existing pages.")
 
     # Process removed URLs
     for url in removed_urls:
         source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
-        cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, source_tag) VALUES (?, ?, ?, ?)", (scrape_date, url, 'removed', source_tag))
+        cursor.execute("SELECT log_id FROM change_log WHERE scrape_date=? AND url=? AND change_type='removed'", (scrape_date, url))
+        if not cursor.fetchone():
+            cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, source_tag) VALUES (?, ?, ?, ?)", (scrape_date, url, 'removed', source_tag))
     conn.commit()
 
     # Process new URLs
     for url in new_urls:
         raw_content, cleaned_content, new_hash, source_tag = all_scraped_pages[url]
-        cursor.execute("INSERT INTO pages (url, content, content_hash, source_tag) VALUES (?, ?, ?, ?)", (url, raw_content, new_hash, source_tag))
-        cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'new', new_hash, source_tag))
+        cursor.execute("INSERT OR REPLACE INTO pages (url, content, content_hash, source_tag) VALUES (?, ?, ?, ?)", (url, raw_content, new_hash, source_tag))
+        cursor.execute("SELECT log_id FROM change_log WHERE scrape_date=? AND url=? AND change_type='new'", (scrape_date, url))
+        existing = cursor.fetchone()
+        if existing:
+            cursor.execute("UPDATE change_log SET content_hash=? WHERE log_id=?", (new_hash, existing[0]))
+        else:
+            cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'new', new_hash, source_tag))
     conn.commit()
 
     # Process existing URLs (only log 'updated' changes; do not bloat DB with 'unchanged')
@@ -364,10 +402,16 @@ def main():
             logging.info(f"  Change detected for: {url}")
             cursor.execute("SELECT content FROM pages WHERE url=?", (url,))
             old_content_row = cursor.fetchone()
-            if old_content_row:
+            if old_content_row and old_content_row[0] != raw_content:
                 cursor.execute("INSERT INTO pages_archive (url, content) VALUES (?, ?)", (url, old_content_row[0]))
             cursor.execute("UPDATE pages SET content=?, content_hash=?, scraped_at=CURRENT_TIMESTAMP WHERE url=?", (raw_content, new_hash, url))
-            cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'updated', new_hash, source_tag))
+            
+            cursor.execute("SELECT log_id FROM change_log WHERE scrape_date=? AND url=? AND change_type='updated'", (scrape_date, url))
+            existing = cursor.fetchone()
+            if existing:
+                cursor.execute("UPDATE change_log SET content_hash=? WHERE log_id=?", (new_hash, existing[0]))
+            else:
+                cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, content_hash, source_tag) VALUES (?, ?, ?, ?, ?)", (scrape_date, url, 'updated', new_hash, source_tag))
 
     conn.commit()
     conn.close()
