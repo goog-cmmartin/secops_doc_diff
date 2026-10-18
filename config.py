@@ -7,8 +7,15 @@ DOC_SOURCES = {
     "Security Command Center": "https://cloud.google.com/security-command-center/docs/",
     "GCP Cloud Logging": "https://cloud.google.com/logging/docs/",
     "GCP Cloud Monitoring": "https://cloud.google.com/monitoring/docs",
-    "GCP Cloud IDS": "https://docs.cloud.google.com/intrusion-detection-system/docs"
+    "GCP Cloud IDS": "https://docs.cloud.google.com/intrusion-detection-system/docs",
+    "Google Threat Intelligence": "https://gtidocs.virustotal.com/"
 }
+
+# Sources that expose a ReadMe/LLM discovery index (llms.txt) and raw Markdown (.md) endpoints
+LLMS_TXT_SOURCES = {
+    "Google Threat Intelligence": "https://gtidocs.readme.io/llms.txt"
+}
+
 EXCLUDED_PATTERNS = [
     "https://cloud.google.com/chronicle/docs/ingestion/default-parsers/",
     "https://cloud.google.com/chronicle/docs/ingestion/parser-list/",

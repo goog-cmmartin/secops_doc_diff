@@ -21,7 +21,8 @@ def index():
         "Security Command Center": "static/SecurityCommandCenter-512-color.png",
         "GCP Cloud IDS": "static/Networking-512-color.png",
         "GCP Cloud Logging": "static/Operations-512-color.png",
-        "GCP Cloud Monitoring": "static/Operations-512-color.png"
+        "GCP Cloud Monitoring": "static/Operations-512-color.png",
+        "Google Threat Intelligence": "static/SecOps-512-color-rgb.png"
     }
     return render_template('index.html', doc_sources=DOC_SOURCES, product_icons=product_icons)
 
