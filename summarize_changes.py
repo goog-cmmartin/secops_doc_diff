@@ -245,29 +245,55 @@ def summarize_with_gemini(change_type, current_content, archived_content=None):
     logging.error(f"Failed to generate summary after {max_retries} retries.")
     return "Error: Failed to generate summary after multiple retries.", None
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
+
+_db_write_lock = threading.Lock()
+
 def update_summary_in_db(log_id, summary, importance=None):
     """Updates the summary and importance for a specific log_id in the change_log table with retry logic."""
     max_retries = 5
-    for attempt in range(max_retries):
-        try:
-            conn = sqlite3.connect(DB_NAME, timeout=60.0)
-            conn.execute("PRAGMA journal_mode=WAL;")
-            conn.execute("PRAGMA busy_timeout=60000;")
-            cursor = conn.cursor()
-            if importance:
-                cursor.execute("UPDATE change_log SET summary = ?, importance = ? WHERE log_id = ?", (summary, importance, log_id))
-            else:
-                cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
-            conn.commit()
-            conn.close()
+    with _db_write_lock:
+        for attempt in range(max_retries):
+            try:
+                conn = sqlite3.connect(DB_NAME, timeout=60.0)
+                conn.execute("PRAGMA journal_mode=WAL;")
+                conn.execute("PRAGMA busy_timeout=60000;")
+                cursor = conn.cursor()
+                if importance:
+                    cursor.execute("UPDATE change_log SET summary = ?, importance = ? WHERE log_id = ?", (summary, importance, log_id))
+                else:
+                    cursor.execute("UPDATE change_log SET summary = ? WHERE log_id = ?", (summary, log_id))
+                conn.commit()
+                conn.close()
+                return
+            except sqlite3.OperationalError as e:
+                if attempt < max_retries - 1:
+                    logging.warning(f"Database operational error updating log_id {log_id}. Retrying in {(attempt + 1) * 2}s: {e}")
+                    time.sleep((attempt + 1) * 2)
+                else:
+                    logging.error(f"Failed to update summary in database for log_id {log_id}: {e}")
+                    raise
+
+def process_single_change(item):
+    log_id, url, change_type = item
+    try:
+        logging.info(f"Processing {change_type.upper()} change for: {url} (Log ID: {log_id})")
+        current_content, archived_content = get_content_versions(url, change_type)
+
+        if not current_content:
+            logging.warning(f"Could not retrieve current content for {url}. Skipping.")
             return
-        except sqlite3.OperationalError as e:
-            if attempt < max_retries - 1:
-                logging.warning(f"Database operational error updating log_id {log_id}. Retrying in {(attempt + 1) * 2}s: {e}")
-                time.sleep((attempt + 1) * 2)
-            else:
-                logging.error(f"Failed to update summary in database for log_id {log_id}: {e}")
-                raise
+
+        summary, importance = summarize_with_gemini(change_type, current_content, archived_content)
+
+        if summary and not summary.startswith("Error:"):
+            update_summary_in_db(log_id, summary, importance)
+            logging.info(f"Successfully generated and saved summary ({importance or 'N/A'}) for: {url}")
+        else:
+            logging.error(f"Failed to generate a valid summary for {url}. Skipping database update.")
+    except Exception as e:
+        logging.error(f"Error processing change for {url} (Log ID: {log_id}): {e}", exc_info=True)
 
 def main():
     parser = argparse.ArgumentParser(
@@ -295,6 +321,12 @@ def main():
         help="Optional. Summarize changes for a specific date (YYYY-MM-DD)."
     )
     parser.add_argument(
+        '--workers',
+        type=int,
+        default=4,
+        help="Number of concurrent worker threads for summarization (default: 4)."
+    )
+    parser.add_argument(
         '--dry-run',
         action='store_true',
         help="Estimate the number of changes to be processed without running the summarizer."
@@ -315,24 +347,11 @@ def main():
         logging.info("No new or updated items found to summarize.")
         return
 
-    for log_id, url, change_type in changes:
-        try:
-            logging.info(f"Processing {change_type.upper()} change for: {url} (Log ID: {log_id})")
-            current_content, archived_content = get_content_versions(url, change_type)
-
-            if not current_content:
-                logging.warning(f"Could not retrieve current content for {url}. Skipping.")
-                continue
-
-            summary, importance = summarize_with_gemini(change_type, current_content, archived_content)
-
-            if summary and not summary.startswith("Error:"):
-                update_summary_in_db(log_id, summary, importance)
-                logging.info(f"Successfully generated and saved summary ({importance or 'N/A'}) for: {url}")
-            else:
-                logging.error(f"Failed to generate a valid summary for {url}. Skipping database update.")
-        except Exception as e:
-            logging.error(f"Error processing change for {url} (Log ID: {log_id}): {e}", exc_info=True)
+    get_gemini_model()
+    with ThreadPoolExecutor(max_workers=args.workers) as executor:
+        futures = [executor.submit(process_single_change, item) for item in changes]
+        for future in as_completed(futures):
+            future.result()
 
 
 if __name__ == "__main__":

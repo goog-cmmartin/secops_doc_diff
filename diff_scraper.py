@@ -21,12 +21,17 @@ logging.basicConfig(
     datefmt='%Y-%m-%d %H:%M:%S'
 )
 
-def create_session_with_retries():
+def create_session_with_retries(accept_markdown=False):
     """Creates a requests.Session with a robust retry strategy and browser user-agent."""
     session = requests.Session()
+    accept_header = (
+        "text/markdown,text/plain;q=0.9,text/html;q=0.8,*/*;q=0.7"
+        if accept_markdown
+        else "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    )
     session.headers.update({
         "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-        "Accept": "text/html,text/markdown,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept": accept_header,
         "Accept-Language": "en-US,en;q=0.9"
     })
     retry_strategy = Retry(
@@ -156,6 +161,14 @@ def is_excluded(url, patterns):
             return True
     return False
 
+def normalize_doc_link(link, base_url):
+    """Normalizes equivalent cloud.google.com and docs.cloud.google.com hostnames to match base_url."""
+    if base_url.startswith("https://cloud.google.com/") and link.startswith("https://docs.cloud.google.com/"):
+        return "https://cloud.google.com/" + link[len("https://docs.cloud.google.com/"):]
+    if base_url.startswith("https://docs.cloud.google.com/") and link.startswith("https://cloud.google.com/"):
+        return "https://docs.cloud.google.com/" + link[len("https://cloud.google.com/"):]
+    return link
+
 def canonicalize_llms_url(url, base_url):
     """Converts a .md URL (e.g. https://gtidocs.readme.io/docs/foo.md) into its canonical web URL under base_url."""
     parsed = urlparse(url)
@@ -199,7 +212,7 @@ def crawl_llms_txt_source(source_tag, base_url, llms_txt_url, max_workers=4):
     broken_links = set()
     updated_at_map = {}
 
-    session = create_session_with_retries()
+    session = create_session_with_retries(accept_markdown=True)
     try:
         resp = session.get(llms_txt_url, timeout=15)
         resp.raise_for_status()
@@ -224,7 +237,7 @@ def crawl_llms_txt_source(source_tag, base_url, llms_txt_url, max_workers=4):
 
     def get_thread_session():
         if not hasattr(thread_local, "session"):
-            thread_local.session = create_session_with_retries()
+            thread_local.session = create_session_with_retries(accept_markdown=True)
         return thread_local.session
 
     completed = 0
@@ -263,7 +276,8 @@ def fetch_page_and_links(url, base_url, session, source_page_url=None):
             
             # Extract links
             for a_tag in soup.find_all('a', href=True):
-                link = urljoin(url, a_tag['href']).split('#')[0]
+                raw_link = urljoin(url, a_tag['href']).split('#')[0]
+                link = normalize_doc_link(raw_link, base_url)
                 if link.startswith(base_url) and not is_excluded(link, EXCLUDED_PATTERNS):
                     links.add(link)
             
@@ -274,7 +288,7 @@ def fetch_page_and_links(url, base_url, session, source_page_url=None):
                 cleaned_content = clean_content(raw_content)
                 content_hash = calculate_hash(cleaned_content)
     except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 404:
+        if e.response is not None and e.response.status_code == 404:
             logging.warning(f"Broken link found: {url} (from {source_page_url or 'start'})")
             broken_link = (source_page_url or 'start', url)
         else:
@@ -289,7 +303,7 @@ def scrape_single_url(url, session):
     if "gtidocs.readme.io" in url or "gtidocs.virustotal.com" in url or url.endswith(".md"):
         md_url = to_markdown_fetch_url(url)
         try:
-            with session.get(md_url, timeout=12) as response:
+            with session.get(md_url, headers={"Accept": "text/markdown,text/plain;q=0.9,*/*;q=0.8"}, timeout=12) as response:
                 response.raise_for_status()
                 cleaned_md, _ = parse_frontmatter_and_clean_md(response.text)
                 return cleaned_md
@@ -320,7 +334,7 @@ def crawl_source(source_tag, base_url, max_workers=4):
 
     def get_thread_session():
         if not hasattr(thread_local, "session"):
-            thread_local.session = create_session_with_retries()
+            thread_local.session = create_session_with_retries(accept_markdown=False)
         return thread_local.session
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
@@ -510,7 +524,7 @@ def main():
         source_scraped_urls = {u for u, data in all_scraped_pages.items() if data[3] == source_tag}
         
         # Safety guard: if a source fetched fewer than 50% of known DB pages, skip removals to avoid false positives
-        if len(source_db_urls) > 10 and len(source_scraped_urls) < (len(source_db_urls) * 0.5):
+        if len(source_db_urls) > 0 and len(source_scraped_urls) < (len(source_db_urls) * 0.5):
             logging.warning(
                 f"Source '{source_tag}' crawl retrieved only {len(source_scraped_urls)}/{len(source_db_urls)} pages. "
                 "Skipping removal detection for this source to prevent false removals."
@@ -521,9 +535,14 @@ def main():
 
     logging.info(f"Diff Summary: {len(new_urls)} new, {len(removed_urls)} removed, {len(existing_urls)} existing pages.")
 
-    # Process removed URLs
+    # Process removed URLs: archive final snapshot and remove from active 'pages' table so they are not re-logged daily
     for url in removed_urls:
         source_tag = next((tag for tag, base in DOC_SOURCES.items() if url.startswith(base)), "Unknown")
+        cursor.execute("SELECT content FROM pages WHERE url=?", (url,))
+        old_content_row = cursor.fetchone()
+        if old_content_row:
+            cursor.execute("INSERT INTO pages_archive (url, content) VALUES (?, ?)", (url, old_content_row[0]))
+        cursor.execute("DELETE FROM pages WHERE url=?", (url,))
         cursor.execute("SELECT log_id FROM change_log WHERE scrape_date=? AND url=? AND change_type='removed'", (scrape_date, url))
         if not cursor.fetchone():
             cursor.execute("INSERT INTO change_log (scrape_date, url, change_type, source_tag) VALUES (?, ?, ?, ?)", (scrape_date, url, 'removed', source_tag))
